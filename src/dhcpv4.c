@@ -652,6 +652,16 @@ void dhcpv4_handle_msg(void *addr, void *data, size_t len,
 	};
 	memcpy(reply.chaddr, req->chaddr, sizeof(reply.chaddr));
 
+	/* Configuration token used to authenticate the DHCP server (RFC3118) */
+	struct dhcpv4_auth_token token = {
+		.protocol = 0,
+		.algorithm = 0,
+		.rdm = 0,
+		.replay = {htonl(time(NULL)), htonl(++serial)}
+	};
+
+	memcpy(token.key, iface->key, sizeof(iface->key));
+
 	reply.options[0] = 0x63;
 	reply.options[1] = 0x82;
 	reply.options[2] = 0x53;
@@ -820,6 +830,8 @@ void dhcpv4_handle_msg(void *addr, void *data, size_t len,
 				dhcpv4_put(&reply, &cookie, DHCPV4_OPT_FORCERENEW_NONCE_CAPABLE,
 					sizeof(one), &one);
 			}
+		} else {
+			dhcpv4_put(&reply, &cookie, DHCPV4_OPT_AUTHENTICATION, sizeof(token), &token);
 		}
 	}
 

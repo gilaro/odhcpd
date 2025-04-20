@@ -273,6 +273,8 @@ struct interface {
 	char *ifname;
 	const char *name;
 
+	uint8_t key[16];
+
 	// IPv6 runtime data
 	struct odhcpd_ipaddr *addr6;
 	size_t addr6_len;

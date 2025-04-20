@@ -82,6 +82,14 @@ struct dhcpv4_message {
 	uint8_t options[312];
 };
 
+struct dhcpv4_auth_token {
+	uint8_t protocol;
+	uint8_t algorithm;
+	uint8_t rdm;
+	uint32_t replay[2];
+	uint8_t key[16];
+} _packed;
+
 struct dhcpv4_auth_forcerenew {
 	uint8_t protocol;
 	uint8_t algorithm;

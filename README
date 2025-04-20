@@ -89,6 +89,8 @@ ndp			string	disabled		Neighbor Discovery Proxy
 
 dynamicdhcp		bool	1			Dynamically create leases
 							for DHCPv4 and DHCPv6
+auth_key		string	<configuration token>	Configuration token used to authenticate
+							the DHCP server (RFC3118)
 dhcpv4_forcereconf	bool	0			Force reconfiguration by sending
 							force renew message even if the client
 							did not include the force renew nonce
