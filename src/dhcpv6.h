@@ -112,6 +112,16 @@ struct dhcpv6_relay_forward_envelope {
 	uint16_t relay_message_len;
 } __attribute__((packed));
 
+struct dhcpv6_auth_token {
+	uint16_t type;
+	uint16_t len;
+	uint8_t protocol;
+	uint8_t algorithm;
+	uint8_t rdm;
+	uint32_t replay[2];
+	uint8_t key[16];
+} _packed;
+
 struct dhcpv6_auth_reconfigure {
 	uint16_t type;
 	uint16_t len;

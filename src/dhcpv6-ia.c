@@ -1382,7 +1382,7 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
 	uint8_t *start = (uint8_t *)&hdr[1], *odata;
 	uint8_t *clid_data = NULL, mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 	size_t hostname_len = 0, response_len = 0;
-	bool notonlink = false, rapid_commit = false, accept_reconf = false;
+	bool notonlink = false, rapid_commit = false, accept_reconf = false, is_authenticated = false;
 	char duidbuf[261], hostname[256];
 
 	dhcpv6_for_each_option(start, end, otype, olen, odata) {
@@ -1408,6 +1408,8 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
 			accept_reconf = true;
 		else if (otype == DHCPV6_OPT_RAPID_COMMIT && hdr->msg_type == DHCPV6_MSG_SOLICIT)
 			rapid_commit = true;
+		else if (otype == DHCPV6_OPT_AUTH)
+			is_authenticated = true;
 	}
 
 	if (!clid_data || !clid_len || clid_len > 130)
@@ -1603,6 +1605,20 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
 				response_len += handshake_len;
 
 				first = a;
+			} else if (is_authenticated && !accept_reconf) {
+				struct dhcpv6_auth_token token = {
+					htons(DHCPV6_OPT_AUTH),
+					htons(sizeof(token) - 4),
+					0, 0, 0,
+					{htonl(time(NULL)), htonl(++serial)},
+					{0}
+				};
+				memcpy(token.key, iface->key, sizeof(iface->key));
+				memcpy(buf, &token, sizeof(token));
+
+				buf += sizeof(token);
+				buflen -= sizeof(token);
+				response_len += sizeof(token);
 			}
 
 			ia_response_len = build_ia(buf, buflen, status, ia, a, iface,
