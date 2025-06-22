@@ -938,6 +938,13 @@ void dhcpv4_handle_msg(void *addr, void *data, size_t len,
 			dhcpv4_put(&reply, &cookie, DHCPV4_OPT_DNR,
 				   dnrs_len, dnrs);
 			break;
+
+		case DHCPV4_OPT_VENDOR_OPTS:
+			struct vendor_option_entry *vendor;
+			list_for_each_entry(vendor, &iface->dhcpv4_vnds_opts, head) {
+				dhcpv4_put(&reply, &cookie, DHCPV4_OPT_VENDOR_OPTS, vendor->vendor_len, vendor->vnd_buf);
+			}
+			break;
 		}
 	}
 

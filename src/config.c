@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <syslog.h>
+#include <inttypes.h>
 
 #include <uci.h>
 #include <uci_blob.h>
@@ -43,6 +44,9 @@ struct config config = {.legacy = false, .main_dhcpv4 = false,
 #define PD_MIN_LEN_MAX (64-2) // must delegate at least 2 bits of prefix
 
 #define OAF_DHCPV6	(OAF_DHCPV6_NA | OAF_DHCPV6_PD)
+
+#define DHCPV4		4
+#define DHCPV6		6
 
 enum {
 	IPV6_PXE_URL,
@@ -112,6 +116,7 @@ enum {
 	IFACE_ATTR_PREFIX_FILTER,
 	IFACE_ATTR_PREFERRED_LIFETIME,
 	IFACE_ATTR_NTP,
+	IFACE_ATTR_VENDOR_OPTS,
 	IFACE_ATTR_MAX
 };
 
@@ -167,12 +172,14 @@ static const struct blobmsg_policy iface_attrs[IFACE_ATTR_MAX] = {
 	[IFACE_ATTR_PREFIX_FILTER] = { .name = "prefix_filter", .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_PREFERRED_LIFETIME] = { .name = "preferred_lifetime", .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_NTP] = { .name = "ntp", .type = BLOBMSG_TYPE_ARRAY },
+	[IFACE_ATTR_VENDOR_OPTS] = { .name = "vendor_opts", .type = BLOBMSG_TYPE_ARRAY },
 };
 
 static const struct uci_blob_param_info iface_attr_info[IFACE_ATTR_MAX] = {
 	[IFACE_ATTR_UPSTREAM] = { .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_DNS] = { .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_DOMAIN] = { .type = BLOBMSG_TYPE_STRING },
+	[IFACE_ATTR_VENDOR_OPTS] = { .type = BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list interface_attr_list = {
@@ -868,6 +875,438 @@ err:
 	return -1;
 }
 
+static void
+vendor_option_ctx_init(struct interface *iface, struct vendor_ctx *ctx, int protocol)
+{
+	struct list_head *vendors;
+
+	switch (protocol) {
+		case DHCPV6:
+			vendors = &iface->dhcpv6_vnds_opts;
+			ctx->vnds_opts_cnt = &iface->dhcpv6_vnds_opts_cnt;
+			ctx->vnds_opts_len = &iface->dhcpv6_vnds_opts_len;
+			break;
+		#ifdef DHCPV4_SUPPORT
+		case DHCPV4:
+			vendors = &iface->dhcpv4_vnds_opts;
+			ctx->vnds_opts_cnt = &iface->dhcpv4_vnds_opts_cnt;
+			ctx->vnds_opts_len = &iface->dhcpv4_vnds_opts_len;
+			break;
+		#endif
+	}
+
+	ctx->vendors = vendors;
+	ctx->protocol = protocol;
+}
+
+static struct vendor_option_entry *
+vendor_option_get_entry(struct interface *iface, struct vendor_ctx *ctx, uint32_t vendor_id)
+{
+	struct vendor_option_entry *vendor;
+
+	syslog(LOG_DEBUG, "(%s) Search vendor ID %" PRIu32, iface->name, vendor_id);
+
+	list_for_each_entry(vendor, ctx->vendors, head) {
+		if (vendor->vendor_id == vendor_id) {
+			syslog(LOG_DEBUG, "(%s) Vendor ID %" PRIu32 " found",
+			       iface->name, vendor_id);
+			return vendor;
+		}
+	}
+
+	syslog(LOG_DEBUG, "(%s) Create vendor ID %" PRIu32, iface->name, vendor_id);
+
+	vendor = calloc(1, sizeof(*vendor));
+	if (!vendor) {
+		syslog(LOG_ERR, "(%s) Allocation failed for vendor ID %" PRIu32,
+		       iface->name, vendor_id);
+		return NULL;
+	}
+
+	(*ctx->vnds_opts_cnt)++;
+
+	vendor->vendor_id = vendor_id;
+
+	for (int i = 0; i < VENDOR_OPTION_HASH_SIZE; i++) {
+		INIT_HLIST_HEAD(&vendor->options[i]);
+	}
+
+	list_add_tail(&vendor->head, ctx->vendors);
+	return vendor;
+}
+
+static inline unsigned int vendor_option_hash(uint16_t code)
+{
+	return code % VENDOR_OPTION_HASH_SIZE;
+}
+
+static bool
+has_vendor_option(struct vendor_option_entry *vendor, uint16_t code)
+{
+	unsigned int hash = vendor_option_hash(code);
+	struct vendor_option *opt;
+	struct hlist_node *node;
+
+	hlist_for_each_entry(opt, node, &vendor->options[hash], option) {
+		if (opt->code == code)
+			return true;
+	}
+	return false;
+}
+
+static int
+vendor_option_add(struct interface *iface, struct vendor_ctx *ctx, uint32_t vendor_id,
+		  uint16_t code, uint8_t *data, size_t len)
+{
+	syslog(LOG_DEBUG, "(%s) Add vendor option [vendor_id=%" PRIu32
+	       ", code=%" PRIu16 ", len=%zu]", iface->name, vendor_id, code, len);
+
+	struct vendor_option_entry *vendor;
+	struct vendor_option *opt;
+	unsigned int hash;
+
+	vendor = vendor_option_get_entry(iface, ctx, vendor_id);
+	if (!vendor) {
+		syslog(LOG_ERR, "(%s) No vendor ID %" PRIu32 " retrieved!",
+		       iface->name, vendor_id);
+		return -ENOMEM;
+	}
+
+	/* Check for duplicates */
+	if (has_vendor_option(vendor, code)) {
+		syslog(LOG_DEBUG, "(%s) Option already exists [vendor_id=%" PRIu32
+		       ", code=%" PRIu16 "]", iface->name, vendor_id, code);
+		return 0;
+	}
+
+	/* Allocate a new option */
+	opt = calloc(1, sizeof(*opt) + len);
+	if (!opt) {
+		syslog(LOG_ERR, "(%s) Option allocation failed [vendor_id=%" PRIu32
+		       ", code=%" PRIu16 "]", iface->name, vendor_id, code);
+		return -ENOMEM;
+	}
+
+	opt->code = code;
+	opt->len = len;
+
+	memcpy(opt->data, data, len);
+
+	/* Add the option to the hash table */
+	hash = vendor_option_hash(code);
+	hlist_add_head(&opt->option, &vendor->options[hash]);
+
+	syslog(LOG_DEBUG, "(%s) Option added [vendor_id=%" PRIu32 ", code=%" PRIu16
+	       ", size=%zu]", iface->name, vendor_id, code, len);
+
+	return 0;
+}
+
+static int vendor_option_build_buffer(struct interface *iface, struct vendor_ctx *ctx)
+{
+	if (*ctx->vnds_opts_cnt == 0)
+		return 0;
+
+	#ifdef DHCPV4_SUPPORT
+	syslog(LOG_DEBUG, "(%s) Build buffers for %zu vendors [%s]", iface->name,
+	       *ctx->vnds_opts_cnt, (ctx->protocol == DHCPV6) ? "DHCPv6" : "DHCPv4");
+	#else
+	syslog(LOG_DEBUG, "(%s) Build buffers for %zu vendors [DHCPv6]", iface->name,
+	       *ctx->vnds_opts_cnt);
+	#endif
+
+	struct vendor_option_entry *vendor;
+	size_t total_len = 0; // sum of buffer sizes
+
+	list_for_each_entry(vendor, ctx->vendors, head) {
+		size_t vendor_len = sizeof(vendor->vendor_id);
+		size_t data_len = 0;
+
+		#ifdef DHCPV4_SUPPORT
+		if (ctx->protocol == DHCPV4)
+			vendor_len += 1; // data length field
+		#endif
+
+		/* Calculate total data length */
+		for (int i = 0; i < VENDOR_OPTION_HASH_SIZE; i++) {
+			struct vendor_option *opt;
+			struct hlist_node *node;
+
+			hlist_for_each_entry(opt, node, &vendor->options[i], option) {
+				#ifdef DHCPV4_SUPPORT
+				data_len += (ctx->protocol == DHCPV6) ?
+					sizeof(uint16_t) * 2 : // code + len for DHCPv6
+					sizeof(uint8_t) * 2; // code + len for DHCPv4
+				#else
+				data_len += sizeof(uint16_t) * 2;
+				#endif
+				data_len += opt->len;
+
+				syslog(LOG_DEBUG, "Option: vendor_id=%" PRIu32 ", code=%"
+				       PRIu16 ", len=%zu", vendor->vendor_id, opt->code, opt->len);
+			}
+		}
+
+		vendor_len += data_len;
+		vendor->vendor_len = vendor_len;
+
+		/* Allocate buffer */
+		vendor->vnd_buf = malloc(vendor_len);
+		if (!vendor->vnd_buf) {
+			syslog(LOG_ERR, "(%s) Buffer allocation failed [vendor_id=%" PRIu32 "]",
+			       iface->name, vendor->vendor_id);
+			return -ENOMEM;
+		}
+
+		syslog(LOG_DEBUG, "(%s) Buffer allocated [vendor_id=%" PRIu32 ", size=%zu]",
+		       iface->name, vendor->vendor_id, vendor_len);
+
+		uint8_t *pos = vendor->vnd_buf;
+
+		/* Vendor ID field */
+		uint32_t vendor_id_be = htonl(vendor->vendor_id);
+		memcpy(pos, &vendor_id_be, sizeof(vendor_id_be));
+		pos += sizeof(vendor_id_be);
+
+		#ifdef DHCPV4_SUPPORT
+		/* DHCPv4 data length field */
+		if (ctx->protocol == DHCPV4)
+			*pos++ = data_len;
+		#endif
+
+		/* Options */
+		for (int i = 0; i < VENDOR_OPTION_HASH_SIZE; i++) {
+			struct vendor_option *opt;
+			struct hlist_node *node;
+
+			hlist_for_each_entry(opt, node, &vendor->options[i], option) {
+				if (ctx->protocol == DHCPV6) {
+					uint16_t code_be = htons(opt->code);
+					uint16_t len_be = htons(opt->len);
+					memcpy(pos, &code_be, sizeof(code_be));
+					pos += sizeof(code_be);
+					memcpy(pos, &len_be, sizeof(len_be));
+					pos += sizeof(len_be);
+				}
+				#ifdef DHCPV4_SUPPORT
+				else {
+					*pos++ = opt->code;
+					*pos++ = opt->len;
+				}
+				#endif
+				memcpy(pos, opt->data, opt->len);
+				pos += opt->len;
+				syslog(LOG_DEBUG, "(%s) Option added [vendor_id=%" PRIu32
+				       ", code=%" PRIu16 ", size=%zu]", iface->name,
+				       vendor->vendor_id, opt->code, opt->len);
+			}
+		}
+
+		/* Free options */
+		for (int i = 0; i < VENDOR_OPTION_HASH_SIZE; i++) {
+			struct vendor_option *opt;
+			struct hlist_node *node, *tmp_node;
+
+			hlist_for_each_entry_safe(opt, node, tmp_node,
+						  &vendor->options[i], option) {
+				hlist_del(&opt->option);
+				free(opt);
+			}
+		}
+
+		#ifdef DHCPV4_SUPPORT
+		total_len += (ctx->protocol == DHCPV6) ?
+			vendor_len + sizeof(uint16_t) * 2 : // options + header
+			vendor_len + sizeof(uint8_t) * 2; // options + header
+		#else
+		total_len += vendor_len + sizeof(uint16_t) * 2;
+		#endif
+
+		#ifdef DHCPV4_SUPPORT
+		syslog(LOG_DEBUG, "(%s) Vendor option completed, total size: %zu", iface->name,
+		       (ctx->protocol == DHCPV6) ? vendor_len + sizeof(uint16_t) * 2 :
+				vendor_len + sizeof(uint8_t) * 2);
+		#else
+		syslog(LOG_DEBUG, "(%s) Vendor option completed, total size: %zu", iface->name,
+		       vendor_len + sizeof(uint16_t) * 2);
+		#endif
+
+	}
+
+	*ctx->vnds_opts_len = total_len;
+	return 0;
+}
+
+/* Cleanup vendor options */
+static void vendor_option_cleanup(struct vendor_ctx *ctx)
+{
+	struct vendor_option_entry *vendor, *tmp_vendor;
+
+	list_for_each_entry_safe(vendor, tmp_vendor, ctx->vendors, head) {
+		for (int i = 0; i < VENDOR_OPTION_HASH_SIZE; i++) {
+			struct vendor_option *opt;
+			struct hlist_node *node, *tmp_node;
+
+			if (!hlist_empty(&vendor->options[i])) {
+				hlist_for_each_entry_safe(opt, node, tmp_node,
+							  &vendor->options[i], option) {
+					hlist_del(&opt->option);
+					free(opt);
+				}
+			}
+		}
+		free(vendor->vnd_buf);
+		list_del(&vendor->head);
+		free(vendor);
+	}
+
+	*ctx->vnds_opts_cnt = 0;
+	*ctx->vnds_opts_len = 0;
+
+	INIT_LIST_HEAD(ctx->vendors);
+}
+
+static int
+parse_vendor_id(const char *str, struct interface *iface, uint32_t *id)
+{
+	char *end;
+	unsigned long val = strtoul(str, &end, 10);
+
+	if (*end || val > UINT32_MAX) {
+		syslog(LOG_ERR, "(%s) Invalid vendor ID '%s'", iface->name, str);
+		return -EINVAL;
+	}
+
+	*id = val;
+	return 0;
+}
+
+static int
+parse_vendor_code(const char *str, struct interface *iface, uint16_t *code, int *protocol)
+{
+	const char *ptr = str;
+	#ifdef DHCPV4_SUPPORT
+	static const char prefix[] = "option4:";
+
+	// Which protocol?
+	if (!strncmp(str, prefix, sizeof(prefix) - 1)) {
+		*protocol = DHCPV4;
+		ptr = str + sizeof(prefix) - 1; // The array contains a NULL char
+	} else {
+		*protocol = DHCPV6;
+	}
+	#else
+	*protocol = DHCPV6;
+	#endif
+
+	// Parse code
+	char *end;
+	unsigned long val = strtoul(ptr, &end, 10);
+
+	#ifdef DHCPV4_SUPPORT
+	if (*end || (*protocol == DHCPV4 && val > UINT8_MAX) || val > UINT16_MAX) {
+		syslog(LOG_ERR, "(%s) Invalid option code '%s'", iface->name, str);
+		return -EINVAL;
+	}
+	#else
+	if (*end || val > UINT16_MAX) {
+		syslog(LOG_ERR, "(%s) Invalid option code '%s'", iface->name, str);
+		return -EINVAL;
+	}
+	#endif
+
+	*code = val;
+	return 0;
+}
+
+static ssize_t
+parse_vendor_data(const char *str, struct interface *iface, uint8_t **data, uint16_t *len)
+{
+	size_t str_len = strlen(str);
+	ssize_t tmp_len;
+
+	// Data between double quotes (ASCII)
+	if (str_len > 2 && str[0] == '"' && str[str_len - 1] == '"') {
+		*data = malloc(str_len - 2);
+		if (!*data) {
+			syslog(LOG_ERR, "Data allocation failed!");
+			return -ENOMEM;
+		}
+
+		memcpy(*data, str + 1, str_len - 2);
+		tmp_len = str_len - 2; // (size_t => ssize_t)
+		*len = (uint16_t)tmp_len;
+		return tmp_len;
+	}
+
+	// Data in hexadecimal encoding
+	*data = malloc(str_len);
+	if (!*data) {
+		syslog(LOG_ERR, "Data allocation failed!");
+		return -ENOMEM;
+	}
+
+	tmp_len = odhcpd_unhexlify(*data, str_len, str);
+
+	if (tmp_len < 0) {
+		syslog(LOG_ERR, "(%s) Invalid data: '%s'!", iface->name, str);
+		return tmp_len;
+	}
+
+	*len = (uint16_t)tmp_len;
+	return tmp_len;
+}
+
+static int vendor_option_parse(struct interface *iface, struct vendor_ctx *ctx, const char *str)
+{
+	struct vendor_option opt = {0};
+	char *token, *saveptr = NULL;
+	uint8_t *data = NULL;
+	int ret = -1; // default return value
+
+	char *ptr = strdup(str); // strtok_r()
+	if (!ptr) {
+		ret = -ENOMEM;
+		goto cleanup;
+	}
+
+	/* Parse vendor ID */
+	token = strtok_r(ptr, ",", &saveptr);
+	if (!token || parse_vendor_id(token, iface, &opt.vendor_id) < 0) {
+		ret = -EINVAL;
+		goto cleanup;
+	}
+
+	/* Parse option code */
+	token = strtok_r(NULL, ",", &saveptr);
+	if (!token || parse_vendor_code(token, iface, &opt.code, &opt.protocol) < 0) {
+		ret = -EINVAL;
+		goto cleanup;
+	}
+
+	/* Check protocol */
+	if (opt.protocol != ctx->protocol) {
+		free(ptr);
+		return 1;
+	}
+
+	/* Parse option data */
+	token = strtok_r(NULL, ",", &saveptr);
+	if (!token || parse_vendor_data(token, iface, &data, &opt.len) < 0) {
+		ret = -EINVAL;
+		goto cleanup;
+	}
+
+	ret = vendor_option_add(iface, ctx, opt.vendor_id, opt.code, data, opt.len);
+
+cleanup:
+	if (data)
+		free(data);
+	free(ptr);
+	return ret;
+}
+
+
 int config_parse_interface(void *data, size_t len, const char *name, bool overwrite)
 {
 	struct odhcpd_ipaddr *addrs = NULL;
@@ -904,6 +1343,10 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 		INIT_LIST_HEAD(&iface->ia_assignments);
 		INIT_LIST_HEAD(&iface->dhcpv4_assignments);
 		INIT_LIST_HEAD(&iface->dhcpv4_fr_ips);
+		INIT_LIST_HEAD(&iface->dhcpv6_vnds_opts);
+		#ifdef DHCPV4_SUPPORT
+		INIT_LIST_HEAD(&iface->dhcpv4_vnds_opts);
+		#endif
 
 		set_interface_defaults(iface);
 
@@ -1455,6 +1898,58 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 					iface->dhcpv6_ntp_cnt++;
 			}
 		}
+	}
+
+	if ((c = tb[IFACE_ATTR_VENDOR_OPTS])) {
+		struct blob_attr *cur;
+		unsigned rem;
+
+		struct vendor_ctx ctx;
+		vendor_option_ctx_init(iface, &ctx, DHCPV6);
+
+		#ifdef DHCPV4_SUPPORT
+		struct vendor_ctx ctx4;
+		vendor_option_ctx_init(iface, &ctx4, DHCPV4);
+		#endif
+
+		blobmsg_for_each_attr(cur, c, rem) {
+			if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING || !blobmsg_check_attr(cur, false))
+				continue;
+
+			int status_code;
+
+			status_code = vendor_option_parse(iface, &ctx, blobmsg_get_string(cur));
+
+			if (status_code < 0) {
+				syslog(LOG_ERR, "Invalid %s value configured for interface '%s'",
+				       iface_attrs[IFACE_ATTR_VENDOR_OPTS].name, iface->name);
+				vendor_option_cleanup(&ctx);
+				goto err;
+			} else if (status_code != 1) {
+				/* Matches with DHCPv6 */
+				continue;
+			}
+
+			#ifdef DHCPV4_SUPPORT
+			/* Fall back to DHCPv4 */
+			if (vendor_option_parse(iface, &ctx4, blobmsg_get_string(cur)) < 0) {
+				vendor_option_cleanup(&ctx4);
+				goto err;
+			}
+			#endif
+		}
+
+		if (vendor_option_build_buffer(iface, &ctx) < 0) {
+			vendor_option_cleanup(&ctx);
+			goto err;
+		}
+
+		#ifdef DHCPV4_SUPPORT
+		if (vendor_option_build_buffer(iface, &ctx4) < 0) {
+			vendor_option_cleanup(&ctx4);
+			goto err;
+		}
+		#endif
 	}
 
 	return 0;

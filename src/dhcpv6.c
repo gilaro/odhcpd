@@ -185,6 +185,7 @@ enum {
 	IOV_DHCPV4O6_SERVER,
 	IOV_DNR,
 	IOV_BOOTFILE_URL,
+	IOV_VENDOR_OPTS,
 	IOV_TOTAL
 };
 
@@ -411,6 +412,11 @@ static void handle_client_request(void *addr, void *data, size_t len,
 	struct dhcpv6_dnr *dnrs = NULL;
 	size_t dnrs_len = 0;
 
+	/* vendor-specific information */
+	void *vnds_opts_ptr = NULL;
+	size_t vnds_opts_cnt = iface->dhcpv6_vnds_opts_cnt;
+	size_t vnds_opts_len = iface->dhcpv6_vnds_opts_len;
+
 	uint16_t otype, olen;
 	uint8_t *odata;
 	uint16_t *reqopts = NULL;
@@ -502,6 +508,25 @@ static void handle_client_request(void *addr, void *data, size_t len,
 				memcpy(&d6dnr->len, &d6dnr_len_be, sizeof(d6dnr_len_be));
 			}
 			break;
+
+		case DHCPV6_OPT_VENDOR_OPTS:
+			struct vendor_option_entry *vendor;
+
+			vnds_opts_ptr = alloca(vnds_opts_len);
+			pos = (uint8_t *)vnds_opts_ptr;
+
+			list_for_each_entry(vendor, &iface->dhcpv6_vnds_opts, head) {
+				uint16_t vnd_opt_type_be = htons(DHCPV6_OPT_VENDOR_OPTS);
+				uint16_t vnd_opt_len_be = htons(vendor->vendor_len);
+
+				memcpy(pos, &vnd_opt_type_be, sizeof(vnd_opt_type_be));
+				pos += sizeof(vnd_opt_type_be);
+				memcpy(pos, &vnd_opt_len_be, sizeof(vnd_opt_len_be));
+				pos += sizeof(vnd_opt_len_be);
+				memcpy(pos, vendor->vnd_buf, vendor->vendor_len);
+				pos += vendor->vendor_len;
+			}
+			break;
 		}
 	}
 
@@ -560,7 +585,8 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		[IOV_DNR] = {dnrs, dnrs_len},
 		[IOV_RELAY_MSG] = {NULL, 0},
 		[IOV_DHCPV4O6_SERVER] = {&dhcpv4o6_server, 0},
-		[IOV_BOOTFILE_URL] = {NULL, 0}
+		[IOV_BOOTFILE_URL] = {NULL, 0},
+		[IOV_VENDOR_OPTS] = {vnds_opts_ptr, (vnds_opts_cnt) ? vnds_opts_len : 0}
 	};
 
 	if (hdr->msg_type == DHCPV6_MSG_RELAY_FORW)
@@ -738,7 +764,8 @@ static void handle_client_request(void *addr, void *data, size_t len,
 				      iov[IOV_CERID].iov_len + iov[IOV_DHCPV6_RAW].iov_len +
 				      iov[IOV_NTP].iov_len + iov[IOV_NTP_ADDR].iov_len +
 				      iov[IOV_SNTP].iov_len + iov[IOV_SNTP_ADDR].iov_len +
-				      iov[IOV_DNR].iov_len + iov[IOV_BOOTFILE_URL].iov_len -
+				      iov[IOV_DNR].iov_len + iov[IOV_BOOTFILE_URL].iov_len +
+				      iov[IOV_VENDOR_OPTS].iov_len -
 				      (4 + opts_end - opts));
 
 	syslog(LOG_DEBUG, "Sending a DHCPv6-%s on %s", iov[IOV_NESTED].iov_len ? "relay-reply" : "reply", iface->name);
