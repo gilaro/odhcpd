@@ -158,6 +158,12 @@ prefix_filter		string	::/0			Only advertise on-link prefixes within
 							filtered out.
 ntp			list	<local address>		NTP servers to announce
 							accepts IPv4 and IPv6
+vendor_opts		list	disabled		Vendor-specific information option (RFC3925/RFC8415)
+			<id>,<code>,<data>		"id" is the IANA enterprise number. "code" identifies
+							the option. "data" is the information transmitted
+			code := <code>|option4:<code>	either as plain text or as a hexadecimal string. The
+			data := "text"|<hexa>		fields are delimited by commas (text between double
+							quotes must not contain commas).
 
 
 Sections of type host (static leases)

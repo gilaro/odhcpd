@@ -60,6 +60,8 @@
 							    (iface)->pio_filter_length) != 0 || \
 		                             (_addr)->prefix < (iface)->pio_filter_length)
 
+#define VENDOR_OPTION_HASH_SIZE 16 // Hash table of vendors
+
 struct interface;
 struct nl_sock;
 extern struct vlist_tree leases;
@@ -264,6 +266,31 @@ struct dnr_options {
 	uint16_t svc_len;
 };
 
+// vendor-specific information option (RFC3925/RFC8415)
+struct vendor_ctx {
+	struct list_head *vendors; // list of vendors
+	int protocol; // DHCPv6 or DHCPv4
+	size_t *vnds_opts_cnt; // number of vendors
+	size_t *vnds_opts_len; // sum of buffer sizes
+};
+
+struct vendor_option_entry {
+	struct list_head head;
+	uint32_t vendor_id;
+	uint16_t vendor_len;	// total length (no header)
+	struct hlist_head options[VENDOR_OPTION_HASH_SIZE];
+	void *vnd_buf;
+};
+
+struct vendor_option {
+	struct hlist_node option;
+	uint32_t vendor_id;
+	int protocol;
+	uint16_t code;
+	uint16_t len;
+	uint8_t data[];
+};
+
 
 struct interface {
 	struct avl_node avl;
@@ -398,6 +425,16 @@ struct interface {
 	// DNR
 	struct dnr_options *dnr;
 	size_t dnr_cnt;
+
+	// vendor-specific information
+	struct list_head dhcpv6_vnds_opts; // list of vendors
+	size_t dhcpv6_vnds_opts_cnt; // number of vendors
+	size_t dhcpv6_vnds_opts_len; // sum of buffer sizes
+	#ifdef DHCPV4_SUPPORT
+	struct list_head dhcpv4_vnds_opts;
+	size_t dhcpv4_vnds_opts_cnt;
+	size_t dhcpv4_vnds_opts_len;
+	#endif
 };
 
 extern struct avl_tree interfaces;
